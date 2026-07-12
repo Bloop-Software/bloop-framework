@@ -56,6 +56,68 @@ namespace Bloop.AWS.Lambda
 
         protected virtual void ConfigureServices(IServiceCollection services) { }
 
+        private ServiceProvider BuildServiceProvider()
+        {
+            var sc = new ServiceCollection();
+            AddLoggingAndTelemetry(sc);
+            sc.AddSingleton<IHttpContextAccessor, HttpContextAccessor>();
+            ConfigureServices(sc);
+            return sc.BuildServiceProvider();
+        }
+
+        private static void AddLoggingAndTelemetry(IServiceCollection sc)
+        {
+            var otlpEndpoint = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT");
+            var useOtlp = !string.IsNullOrEmpty(otlpEndpoint);
+            var serviceName = Environment.GetEnvironmentVariable("OTEL_SERVICE_NAME") ?? "bloop";
+
+            var loggerConfig = new LoggerConfiguration()
+                .MinimumLevel.Information()
+                .Enrich.FromLogContext()
+                .Destructure.UsingAttributes();
+
+            if (useOtlp)
+                loggerConfig.WriteTo.OpenTelemetry(o =>
+                {
+                    o.Endpoint = otlpEndpoint!;
+                    o.ResourceAttributes = new Dictionary<string, object>
+                    {
+                        ["service.name"] = serviceName,
+                    };
+                    var headers = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS");
+                    if (!string.IsNullOrEmpty(headers))
+                        foreach (var pair in headers.Split(','))
+                        {
+                            var parts = pair.Split('=', 2);
+                            if (parts.Length == 2)
+                                o.Headers[parts[0].Trim()] = parts[1].Trim();
+                        }
+                });
+            else
+                loggerConfig.WriteTo.Console();
+
+            sc.AddLogging(builder =>
+            {
+                builder.ClearProviders();
+                builder.AddSerilog(loggerConfig.CreateLogger(), dispose: true);
+            });
+
+            sc.AddOpenTelemetry()
+                .ConfigureResource(r => r.AddService(serviceName))
+                .WithTracing(tracing =>
+                {
+                    tracing.AddHttpClientInstrumentation();
+                    if (useOtlp)
+                        tracing.AddOtlpExporter();
+                })
+                .WithMetrics(metrics =>
+                {
+                    metrics.AddHttpClientInstrumentation();
+                    if (useOtlp)
+                        metrics.AddOtlpExporter();
+                });
+        }
+
         protected abstract Task<WebApiResponse<TResponse>> HandleRequestAsync(
             IServiceProvider services, TRequest? request);
 
@@ -67,63 +129,7 @@ namespace Bloop.AWS.Lambda
             {
                 lock (_lock)
                 {
-                    if (_services == null)
-                    {
-                        var sc = new ServiceCollection();
-                        var otlpEndpoint = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT");
-                        var useOtlp = !string.IsNullOrEmpty(otlpEndpoint);
-                        var serviceName = Environment.GetEnvironmentVariable("OTEL_SERVICE_NAME") ?? "bloop";
-
-                        var loggerConfig = new LoggerConfiguration()
-                            .MinimumLevel.Information()
-                            .Enrich.FromLogContext()
-                            .Destructure.UsingAttributes();
-
-                        if (useOtlp)
-                            loggerConfig.WriteTo.OpenTelemetry(o =>
-                            {
-                                o.Endpoint = otlpEndpoint!;
-                                o.ResourceAttributes = new Dictionary<string, object>
-                                {
-                                    ["service.name"] = serviceName,
-                                };
-                                var headers = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS");
-                                if (!string.IsNullOrEmpty(headers))
-                                    foreach (var pair in headers.Split(','))
-                                    {
-                                        var parts = pair.Split('=', 2);
-                                        if (parts.Length == 2)
-                                            o.Headers[parts[0].Trim()] = parts[1].Trim();
-                                    }
-                            });
-                        else
-                            loggerConfig.WriteTo.Console();
-
-                        sc.AddLogging(builder =>
-                        {
-                            builder.ClearProviders();
-                            builder.AddSerilog(loggerConfig.CreateLogger(), dispose: true);
-                        });
-
-                        sc.AddOpenTelemetry()
-                            .ConfigureResource(r => r.AddService(serviceName))
-                            .WithTracing(tracing =>
-                            {
-                                tracing.AddHttpClientInstrumentation();
-                                if (useOtlp)
-                                    tracing.AddOtlpExporter();
-                            })
-                            .WithMetrics(metrics =>
-                            {
-                                metrics.AddHttpClientInstrumentation();
-                                if (useOtlp)
-                                    metrics.AddOtlpExporter();
-                            });
-
-                        sc.AddSingleton<IHttpContextAccessor, HttpContextAccessor>();
-                        ConfigureServices(sc);
-                        _services = sc.BuildServiceProvider();
-                    }
+                    _services ??= BuildServiceProvider();
                 }
             }
 
