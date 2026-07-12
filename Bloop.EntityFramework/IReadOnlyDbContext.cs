@@ -1,4 +1,4 @@
-﻿namespace Bloop.EntityFramework
+namespace Bloop.EntityFramework
 {
     public interface IReadOnlyDbContext
     {

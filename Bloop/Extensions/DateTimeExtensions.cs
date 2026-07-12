@@ -1,4 +1,4 @@
-﻿namespace Bloop.Extensions
+namespace Bloop.Extensions
 {
     public static class DateTimeExtensions
     {

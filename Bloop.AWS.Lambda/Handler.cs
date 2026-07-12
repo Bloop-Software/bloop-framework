@@ -11,23 +11,55 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using Serilog;
 using System.Net;
+using System.Text;
 using System.Text.Json;
 
 namespace Bloop.AWS.Lambda
 {
     public abstract class Handler<TRequest, TResponse>
     {
+        // Web defaults: camelCase property names on the wire, case-insensitive binding.
+        private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
         private static ServiceProvider? _services;
         private static readonly object _lock = new();
 
-        protected APIGatewayProxyRequest? GatewayRequest { get; private set; }
+        private static JwtTokenValidator? _tokenValidator;
+
+        protected GatewayEvent? GatewayRequest { get; private set; }
+
+        // Verifies the bearer token's signature, issuer, audience and lifetime, and returns
+        // its identity claims. Does not consult session state; use GetAuthenticatedUserIdAsync
+        // in request handlers so a registered ISessionValidator is also enforced.
+        protected AuthenticatedToken GetAuthenticatedToken()
+        {
+            var authHeader = GatewayRequest?.Headers
+                ?.FirstOrDefault(h => h.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase)).Value;
+
+            if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                throw new WebApiException(HttpStatusCode.Unauthorized, "Authentication required");
+
+            _tokenValidator ??= JwtTokenValidator.FromEnvironment();
+            return _tokenValidator.Validate(authHeader["Bearer ".Length..]);
+        }
+
+        protected async Task<Guid> GetAuthenticatedUserIdAsync(IServiceProvider services)
+        {
+            var token = GetAuthenticatedToken();
+
+            var sessionValidator = services.GetService<ISessionValidator>();
+            if (sessionValidator != null)
+                await sessionValidator.ValidateSessionAsync(token.UserId, token.SessionId);
+
+            return token.UserId;
+        }
 
         protected virtual void ConfigureServices(IServiceCollection services) { }
 
         protected abstract Task<WebApiResponse<TResponse>> HandleRequestAsync(
             IServiceProvider services, TRequest? request);
 
-        public async Task<APIGatewayProxyResponse> Handle(APIGatewayProxyRequest request, ILambdaContext context)
+        public async Task<APIGatewayHttpApiV2ProxyResponse> Handle(GatewayEvent request, ILambdaContext context)
         {
             GatewayRequest = request;
 
@@ -99,29 +131,36 @@ namespace Bloop.AWS.Lambda
 
             var accessor = scope.ServiceProvider.GetRequiredService<IHttpContextAccessor>();
             var httpContext = new DefaultHttpContext();
-            if (request.RequestContext?.Identity?.SourceIp != null)
-                httpContext.Connection.RemoteIpAddress =
-                    IPAddress.TryParse(request.RequestContext.Identity.SourceIp, out var ip)
-                        ? ip : IPAddress.Loopback;
+            httpContext.Connection.RemoteIpAddress =
+                request.ResolvedSourceIp != null
+                    && IPAddress.TryParse(request.ResolvedSourceIp, out var ip)
+                    ? ip : IPAddress.Loopback;
             if (request.Headers?.TryGetValue("User-Agent", out var userAgent) == true)
                 httpContext.Request.Headers["User-Agent"] = userAgent;
             accessor.HttpContext = httpContext;
 
             try
             {
-                var payload = JsonSerializer.Deserialize<TRequest>(request.Body);
+                TRequest? payload = default;
+                if (!string.IsNullOrEmpty(request.Body))
+                    payload = JsonSerializer.Deserialize<TRequest>(request.Body, JsonOptions);
+
                 var result = await HandleRequestAsync(scope.ServiceProvider, payload);
 
-                return new APIGatewayProxyResponse
+                var headers = new Dictionary<string, string> { ["Content-Type"] = "application/json" };
+                foreach (var header in result.Headers)
+                    headers[header.Key] = header.Value;
+
+                return new APIGatewayHttpApiV2ProxyResponse
                 {
                     StatusCode = (int)result.StatusCode,
-                    Headers = new Dictionary<string, string> { ["Content-Type"] = "application/json" },
-                    Body = JsonSerializer.Serialize(result.Response),
+                    Headers = headers,
+                    Body = JsonSerializer.Serialize(result.Response, JsonOptions),
                 };
             }
             catch (JsonException)
             {
-                return new APIGatewayProxyResponse
+                return new APIGatewayHttpApiV2ProxyResponse
                 {
                     StatusCode = 400,
                     Headers = new Dictionary<string, string> { ["Content-Type"] = "application/json" },
@@ -130,7 +169,7 @@ namespace Bloop.AWS.Lambda
             }
             catch (WebApiException ex)
             {
-                return new APIGatewayProxyResponse
+                return new APIGatewayHttpApiV2ProxyResponse
                 {
                     StatusCode = (int)ex.StatusCode,
                     Headers = new Dictionary<string, string> { ["Content-Type"] = "application/json" },
@@ -141,7 +180,7 @@ namespace Bloop.AWS.Lambda
             {
                 context.Logger.LogError($"Unhandled error for request {context.TraceId}: {ex.Message}\r\n at {ex.StackTrace}");
 
-                return new APIGatewayProxyResponse
+                return new APIGatewayHttpApiV2ProxyResponse
                 {
                     StatusCode = 500,
                     Headers = new Dictionary<string, string> { ["Content-Type"] = "application/json" },

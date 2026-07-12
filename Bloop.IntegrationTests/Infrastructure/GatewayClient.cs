@@ -25,7 +25,7 @@ public sealed class GatewayClient(HttpClient httpClient, UserTokenStore users)
 
     public async Task<HttpResponseMessage> PostRawAsync(string path, object request, string? actingAs = null)
     {
-        var message = new HttpRequestMessage(HttpMethod.Post, path)
+        var message = new HttpRequestMessage(HttpMethod.Post, Relative(path))
         {
             Content = new StringContent(
                 JsonSerializer.Serialize(request, JsonOptions),
@@ -47,10 +47,15 @@ public sealed class GatewayClient(HttpClient httpClient, UserTokenStore users)
 
     public async Task<HttpResponseMessage> GetRawAsync(string path, string? actingAs = null)
     {
-        var message = new HttpRequestMessage(HttpMethod.Get, path);
+        var message = new HttpRequestMessage(HttpMethod.Get, Relative(path));
         ApplyAuth(message, actingAs);
         return await httpClient.SendAsync(message);
     }
+
+    // Test steps use absolute-style paths ("/auth/login"); resolve them relative to the
+    // gateway base address so its path segment (e.g. floci's /execute-api/{id}/{stage})
+    // is preserved rather than discarded by absolute-path URI resolution.
+    private static string Relative(string path) => path.TrimStart('/');
 
     private void ApplyAuth(HttpRequestMessage message, string? actingAs)
     {
