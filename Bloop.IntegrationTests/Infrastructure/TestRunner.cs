@@ -90,11 +90,16 @@ public sealed class TestRunner(
         lifetime.StopApplication();
     }
 
+    // Collections flatten into their leaf steps so each is reported and checkpointed
+    // individually; groups (randomised order) stay as single units.
     private static List<ITestStep> FlattenSteps(ITestStep step)
     {
-        if (step is ICompositeStep)
+        if (step is not TestCollection collection)
             return [step];
 
-        return [step];
+        var result = new List<ITestStep>();
+        foreach (var child in collection.Steps)
+            result.AddRange(FlattenSteps(child));
+        return result;
     }
 }

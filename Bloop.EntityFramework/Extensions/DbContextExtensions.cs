@@ -83,6 +83,29 @@ namespace Bloop.EntityFramework.Extensions
                 await dbContext.Database.ExecuteSqlRawAsync(sb.ToString());
             }
 
+            public async Task<bool> DoesConstraintExistAsync(string schema, string table, string constraintName)
+            {
+                var count = await dbContext.Database
+                    .SqlQueryRaw<int>(
+                        $"SELECT COUNT(*)::int AS \"Value\" FROM information_schema.table_constraints WHERE table_schema = {{0}} AND table_name = {{1}} AND constraint_name = {{2}}",
+                        schema, table, constraintName)
+                    .FirstAsync();
+                return count > 0;
+            }
+
+            public async Task AddPrimaryKeyAsync(string schema, string table, string constraintName, string[] columns)
+            {
+                var columnList = string.Join(", ", columns.Select(c => Q(c)));
+                await dbContext.Database.ExecuteSqlRawAsync(
+                    $"ALTER TABLE {Q(schema)}.{Q(table)} ADD CONSTRAINT {Q(constraintName)} PRIMARY KEY ({columnList})");
+            }
+
+            public async Task SetColumnDefaultAsync(string schema, string table, string column, string defaultValue)
+            {
+                await dbContext.Database.ExecuteSqlRawAsync(
+                    $"ALTER TABLE {Q(schema)}.{Q(table)} ALTER COLUMN {Q(column)} SET DEFAULT {defaultValue}");
+            }
+
             public async Task DropColumnAsync(string schema, string table, string column)
             {
                 await dbContext.Database.ExecuteSqlRawAsync(
@@ -193,6 +216,9 @@ namespace Bloop.EntityFramework.Extensions
                 var defaultValueSql = property.GetDefaultValueSql();
                 if (defaultValueSql != null)
                     sb.Append($" DEFAULT {defaultValueSql}");
+                else if (property.TryGetDefaultValue(out var defaultValue) && defaultValue != null
+                    && property.FindTypeMapping() is RelationalTypeMapping mapping)
+                    sb.Append($" DEFAULT {mapping.GenerateSqlLiteral(defaultValue)}");
 
                 columnDefs.Add(sb.ToString());
             }

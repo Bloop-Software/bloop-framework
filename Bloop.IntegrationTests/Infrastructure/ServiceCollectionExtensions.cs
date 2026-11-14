@@ -20,8 +20,11 @@ public static class ServiceCollectionExtensions
 
         services.AddHttpClient<GatewayClient>(client =>
         {
-            client.BaseAddress = new Uri(settings.GatewayUrl);
-        });
+            // Trailing slash is required for relative path resolution to keep the base path.
+            client.BaseAddress = new Uri(settings.GatewayUrl.TrimEnd('/') + "/");
+        })
+        // Tests assert on redirect responses; never follow them.
+        .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
 
         services.AddSingleton(sp => new TestContext
         {

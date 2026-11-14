@@ -1,8 +1,12 @@
 using System.Security.Cryptography;
+using Microsoft.Extensions.Logging;
 
 namespace Bloop.IntegrationTests.Infrastructure;
 
-public sealed class TestGroup(string name, params ITestStep[] steps) : ICompositeStep
+// Executes its steps in a random order to catch hidden ordering dependencies.
+// The runner treats a group as a single unit; on failure the shuffled order is
+// logged and persisted so a resumed run continues deterministically.
+public sealed class TestGroup(string name, params ITestStep[] steps) : ITestStep
 {
     public string Name => name;
 
@@ -31,6 +35,11 @@ public sealed class TestGroup(string name, params ITestStep[] steps) : IComposit
             }
             catch
             {
+                context.Logger.LogError(
+                    "Group '{Group}' failed at '{Step}'; shuffled order was [{Order}]",
+                    Name, steps[indices[i]].Name,
+                    string.Join(", ", indices.Select(x => steps[x].Name)));
+
                 context.GroupResume = new GroupResumeData
                 {
                     ShuffledIndices = indices,
