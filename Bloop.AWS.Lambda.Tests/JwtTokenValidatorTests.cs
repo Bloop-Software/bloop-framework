@@ -10,13 +10,13 @@ namespace Bloop.AWS.Lambda.Tests;
 
 public class JwtTokenValidatorTests
 {
-    private const string Issuer = "test-issuer";
-    private const string Audience = "test-audience";
-    private const string PrivateKey = "test-private-key-that-is-long-enough-for-hmac-sha256";
+    internal const string Issuer = "test-issuer";
+    internal const string Audience = "test-audience";
+    internal const string PrivateKey = "test-private-key-that-is-long-enough-for-hmac-sha256";
 
     private readonly JwtTokenValidator _validator = new(Issuer, Audience, PrivateKey);
 
-    private static string CreateToken(
+    internal static string CreateToken(
         Guid? userId = null,
         Guid? sessionId = null,
         string issuer = Issuer,
