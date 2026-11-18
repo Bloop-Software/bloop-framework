@@ -14,40 +14,52 @@ public sealed class GatewayClient(HttpClient httpClient, UserTokenStore users)
 
     public string ActingAs { get; set; } = TestUsers.Anonymous;
 
-    public async Task<T> PostAsync<T>(string path, object request, string? actingAs = null)
+    public Task<T> PostAsync<T>(string path, object request, string? actingAs = null) =>
+        SendAsync<T>(HttpMethod.Post, path, request, actingAs);
+
+    public Task<HttpResponseMessage> PostRawAsync(string path, object request, string? actingAs = null) =>
+        SendRawAsync(HttpMethod.Post, path, request, actingAs);
+
+    public Task<T> GetAsync<T>(string path, string? actingAs = null) =>
+        SendAsync<T>(HttpMethod.Get, path, null, actingAs);
+
+    public Task<HttpResponseMessage> GetRawAsync(string path, string? actingAs = null) =>
+        SendRawAsync(HttpMethod.Get, path, null, actingAs);
+
+    public Task<T> PutAsync<T>(string path, object request, string? actingAs = null) =>
+        SendAsync<T>(HttpMethod.Put, path, request, actingAs);
+
+    public Task<HttpResponseMessage> PutRawAsync(string path, object request, string? actingAs = null) =>
+        SendRawAsync(HttpMethod.Put, path, request, actingAs);
+
+    public Task<T> PatchAsync<T>(string path, object request, string? actingAs = null) =>
+        SendAsync<T>(HttpMethod.Patch, path, request, actingAs);
+
+    public Task<HttpResponseMessage> PatchRawAsync(string path, object request, string? actingAs = null) =>
+        SendRawAsync(HttpMethod.Patch, path, request, actingAs);
+
+    public Task<HttpResponseMessage> DeleteRawAsync(string path, string? actingAs = null) =>
+        SendRawAsync(HttpMethod.Delete, path, null, actingAs);
+
+    public async Task<T> SendAsync<T>(HttpMethod method, string path, object? request = null, string? actingAs = null)
     {
-        var response = await PostRawAsync(path, request, actingAs);
+        var response = await SendRawAsync(method, path, request, actingAs);
         response.EnsureSuccessStatusCode();
 
         return await response.Content.ReadFromJsonAsync<T>(JsonOptions)
-            ?? throw new InvalidOperationException($"POST {path} returned null body");
+            ?? throw new InvalidOperationException($"{method} {path} returned null body");
     }
 
-    public async Task<HttpResponseMessage> PostRawAsync(string path, object request, string? actingAs = null)
+    public async Task<HttpResponseMessage> SendRawAsync(
+        HttpMethod method, string path, object? request = null, string? actingAs = null)
     {
-        var message = new HttpRequestMessage(HttpMethod.Post, Relative(path))
-        {
-            Content = new StringContent(
+        var message = new HttpRequestMessage(method, Relative(path));
+
+        if (request != null)
+            message.Content = new StringContent(
                 JsonSerializer.Serialize(request, JsonOptions),
-                Encoding.UTF8, "application/json"),
-        };
+                Encoding.UTF8, "application/json");
 
-        ApplyAuth(message, actingAs);
-        return await httpClient.SendAsync(message);
-    }
-
-    public async Task<T> GetAsync<T>(string path, string? actingAs = null)
-    {
-        var response = await GetRawAsync(path, actingAs);
-        response.EnsureSuccessStatusCode();
-
-        return await response.Content.ReadFromJsonAsync<T>(JsonOptions)
-            ?? throw new InvalidOperationException($"GET {path} returned null body");
-    }
-
-    public async Task<HttpResponseMessage> GetRawAsync(string path, string? actingAs = null)
-    {
-        var message = new HttpRequestMessage(HttpMethod.Get, Relative(path));
         ApplyAuth(message, actingAs);
         return await httpClient.SendAsync(message);
     }

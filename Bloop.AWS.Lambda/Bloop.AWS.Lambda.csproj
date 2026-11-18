@@ -29,4 +29,8 @@
 	  <ProjectReference Include="..\Bloop.WebApi\Bloop.WebApi.csproj" />
 	</ItemGroup>
 
+	<ItemGroup>
+		<InternalsVisibleTo Include="Bloop.AWS.Lambda.Tests" />
+	</ItemGroup>
+
 </Project>

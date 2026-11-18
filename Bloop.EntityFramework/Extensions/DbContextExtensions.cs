@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
+using System.Linq.Expressions;
 using System.Text;
 
 namespace Bloop.EntityFramework.Extensions
@@ -161,7 +162,7 @@ namespace Bloop.EntityFramework.Extensions
             {
                 var model = GetDesignTimeModel(dbContext);
                 var entityTypes = model.GetEntityTypes()
-                    .Where(et => et.GetTableName() != null)
+                    .Where(et => et.GetTableName() != null && !et.IsTableExcludedFromMigrations())
                     .ToList();
 
                 foreach (var entityType in entityTypes)
@@ -169,6 +170,45 @@ namespace Bloop.EntityFramework.Extensions
 
                 foreach (var entityType in entityTypes)
                     await CreateForeignKeysForEntityTypeAsync(dbContext, entityType);
+            }
+
+            // Creates every listed table before any foreign key, so the entities may
+            // reference each other in any order.
+            public async Task CreateTablesFromModelAsync(Type[] entityClrTypes)
+            {
+                var model = GetDesignTimeModel(dbContext);
+                var entityTypes = entityClrTypes.Select(t => FindEntityType(model, t)).ToList();
+
+                foreach (var entityType in entityTypes)
+                    await CreateTableFromEntityTypeAsync(dbContext, entityType);
+
+                foreach (var entityType in entityTypes)
+                    await CreateForeignKeysForEntityTypeAsync(dbContext, entityType);
+            }
+
+            public async Task AddColumnFromModelAsync<TEntity>(Expression<Func<TEntity, object?>> property)
+                where TEntity : class
+            {
+                var entityType = FindEntityType(GetDesignTimeModel(dbContext), typeof(TEntity));
+                await dbContext.Database.ExecuteSqlRawAsync(
+                    BuildAddColumnSql(entityType, FindProperty(entityType, property)));
+            }
+
+            public async Task AlterColumnTypeFromModelAsync<TEntity>(Expression<Func<TEntity, object?>> property)
+                where TEntity : class
+            {
+                var entityType = FindEntityType(GetDesignTimeModel(dbContext), typeof(TEntity));
+                await dbContext.Database.ExecuteSqlRawAsync(
+                    BuildAlterColumnTypeSql(entityType, FindProperty(entityType, property)));
+            }
+
+            public async Task CreateIndexFromModelAsync<TEntity>(string indexName) where TEntity : class
+            {
+                var entityType = FindEntityType(GetDesignTimeModel(dbContext), typeof(TEntity));
+                var index = entityType.GetIndexes().FirstOrDefault(i => i.GetDatabaseName() == indexName)
+                    ?? throw new InvalidOperationException(
+                        $"Index '{indexName}' is not defined on entity type '{typeof(TEntity).Name}'");
+                await dbContext.Database.ExecuteSqlRawAsync(BuildCreateIndexSql(entityType, index));
             }
         }
 
@@ -184,44 +224,73 @@ namespace Bloop.EntityFramework.Extensions
             ?? throw new InvalidOperationException(
                 $"Cannot determine store type for property '{property.DeclaringType.ClrType.Name}.{property.Name}'");
 
-        private static async Task CreateTableFromEntityTypeAsync(DbContext context, IReadOnlyEntityType entityType)
+        private static IReadOnlyEntityType FindEntityType(IModel model, Type clrType)
         {
-            var tableName = entityType.GetTableName()!;
-            var schema = entityType.GetSchema() ?? "public";
-            var columnDefs = new List<string>();
+            var entityType = model.FindEntityType(clrType)
+                ?? throw new InvalidOperationException(
+                    $"Entity type '{clrType.Name}' is not part of the model");
 
-            foreach (var property in entityType.GetProperties())
-            {
-                var columnName = property.GetColumnName()
-                    ?? throw new InvalidOperationException(
-                        $"Cannot determine column name for property '{property.Name}'");
-                var storeType = GetStoreType(property);
+            if (entityType.IsTableExcludedFromMigrations())
+                throw new InvalidOperationException(
+                    $"Entity type '{clrType.Name}' is excluded from migrations; its table is owned elsewhere");
 
-                var sb = new StringBuilder();
-                sb.Append($"{Q(columnName)} {storeType}");
+            return entityType;
+        }
 
-                var strategy = property.FindAnnotation("Npgsql:ValueGenerationStrategy")?.Value?.ToString();
-                if (strategy == "IdentityAlwaysColumn")
-                    sb.Append(" GENERATED ALWAYS AS IDENTITY");
-                else if (strategy == "IdentityByDefaultColumn")
-                    sb.Append(" GENERATED BY DEFAULT AS IDENTITY");
+        private static IReadOnlyProperty FindProperty<TEntity>(
+            IReadOnlyEntityType entityType, Expression<Func<TEntity, object?>> property)
+        {
+            var body = property.Body is UnaryExpression { NodeType: ExpressionType.Convert } convert
+                ? convert.Operand
+                : property.Body;
 
-                if (!property.IsNullable)
-                    sb.Append(" NOT NULL");
+            if (body is not MemberExpression member)
+                throw new ArgumentException("Expression must select a single property", nameof(property));
 
-                var collation = property.GetCollation();
-                if (collation != null)
-                    sb.Append($" COLLATE {Q(collation)}");
+            return entityType.FindProperty(member.Member.Name)
+                ?? throw new InvalidOperationException(
+                    $"Property '{member.Member.Name}' is not mapped on '{typeof(TEntity).Name}'");
+        }
 
-                var defaultValueSql = property.GetDefaultValueSql();
-                if (defaultValueSql != null)
-                    sb.Append($" DEFAULT {defaultValueSql}");
-                else if (property.TryGetDefaultValue(out var defaultValue) && defaultValue != null
-                    && property.FindTypeMapping() is RelationalTypeMapping mapping)
-                    sb.Append($" DEFAULT {mapping.GenerateSqlLiteral(defaultValue)}");
+        private static string TableName(IReadOnlyEntityType entityType) =>
+            $"{Q(entityType.GetSchema() ?? "public")}.{Q(entityType.GetTableName()!)}";
 
-                columnDefs.Add(sb.ToString());
-            }
+        private static string ColumnName(IReadOnlyProperty property) =>
+            property.GetColumnName()
+            ?? throw new InvalidOperationException(
+                $"Cannot determine column name for property '{property.Name}'");
+
+        internal static string BuildColumnDefinition(IReadOnlyProperty property)
+        {
+            var sb = new StringBuilder();
+            sb.Append($"{Q(ColumnName(property))} {GetStoreType(property)}");
+
+            var strategy = property.FindAnnotation("Npgsql:ValueGenerationStrategy")?.Value?.ToString();
+            if (strategy == "IdentityAlwaysColumn")
+                sb.Append(" GENERATED ALWAYS AS IDENTITY");
+            else if (strategy == "IdentityByDefaultColumn")
+                sb.Append(" GENERATED BY DEFAULT AS IDENTITY");
+
+            if (!property.IsNullable)
+                sb.Append(" NOT NULL");
+
+            var collation = property.GetCollation();
+            if (collation != null)
+                sb.Append($" COLLATE {Q(collation)}");
+
+            var defaultValueSql = property.GetDefaultValueSql();
+            if (defaultValueSql != null)
+                sb.Append($" DEFAULT {defaultValueSql}");
+            else if (property.TryGetDefaultValue(out var defaultValue) && defaultValue != null
+                && property.FindTypeMapping() is RelationalTypeMapping mapping)
+                sb.Append($" DEFAULT {mapping.GenerateSqlLiteral(defaultValue)}");
+
+            return sb.ToString();
+        }
+
+        internal static string BuildCreateTableSql(IReadOnlyEntityType entityType)
+        {
+            var columnDefs = entityType.GetProperties().Select(BuildColumnDefinition).ToList();
 
             var primaryKey = entityType.FindPrimaryKey();
             if (primaryKey != null)
@@ -232,58 +301,65 @@ namespace Bloop.EntityFramework.Extensions
                     $"CONSTRAINT {Q(constraintName)} PRIMARY KEY ({string.Join(", ", pkColumns)})");
             }
 
-            var createSql =
-                $"CREATE TABLE {Q(schema)}.{Q(tableName)} (\n  {string.Join(",\n  ", columnDefs)}\n)";
-            await context.Database.ExecuteSqlRawAsync(createSql);
-
-            foreach (var index in entityType.GetIndexes())
-            {
-                var indexName = index.GetDatabaseName()
-                    ?? $"ix_{tableName}_{string.Join("_", index.Properties.Select(p => p.GetColumnName()))}";
-                var collations = index.FindAnnotation("Relational:Collation")?.Value
-                    as IReadOnlyList<string?>;
-
-                var indexColumns = index.Properties.Select((p, i) =>
-                {
-                    var colRef = Q(p.GetColumnName()!);
-                    if (collations != null && i < collations.Count && collations[i] != null)
-                        colRef += $" COLLATE {Q(collations[i]!)}";
-                    return colRef;
-                });
-
-                var uniqueStr = index.IsUnique ? "UNIQUE " : "";
-                var indexSql =
-                    $"CREATE {uniqueStr}INDEX {Q(indexName)} ON {Q(schema)}.{Q(tableName)} ({string.Join(", ", indexColumns)})";
-                await context.Database.ExecuteSqlRawAsync(indexSql);
-            }
+            return $"CREATE TABLE {TableName(entityType)} (\n  {string.Join(",\n  ", columnDefs)}\n)";
         }
 
-        private static async Task CreateForeignKeysForEntityTypeAsync(DbContext context, IReadOnlyEntityType entityType)
+        internal static string BuildCreateIndexSql(IReadOnlyEntityType entityType, IReadOnlyIndex index)
         {
-            var tableName = entityType.GetTableName()!;
-            var schema = entityType.GetSchema() ?? "public";
+            var indexName = index.GetDatabaseName()
+                ?? $"ix_{entityType.GetTableName()}_{string.Join("_", index.Properties.Select(p => p.GetColumnName()))}";
+            var collations = index.FindAnnotation("Relational:Collation")?.Value
+                as IReadOnlyList<string?>;
 
+            var indexColumns = index.Properties.Select((p, i) =>
+            {
+                var colRef = Q(p.GetColumnName()!);
+                if (collations != null && i < collations.Count && collations[i] != null)
+                    colRef += $" COLLATE {Q(collations[i]!)}";
+                return colRef;
+            });
+
+            var uniqueStr = index.IsUnique ? "UNIQUE " : "";
+            return $"CREATE {uniqueStr}INDEX {Q(indexName)} ON {TableName(entityType)} ({string.Join(", ", indexColumns)})";
+        }
+
+        internal static string BuildAddColumnSql(IReadOnlyEntityType entityType, IReadOnlyProperty property) =>
+            $"ALTER TABLE {TableName(entityType)} ADD COLUMN {BuildColumnDefinition(property)}";
+
+        internal static string BuildAlterColumnTypeSql(IReadOnlyEntityType entityType, IReadOnlyProperty property) =>
+            $"ALTER TABLE {TableName(entityType)} ALTER COLUMN {Q(ColumnName(property))} TYPE {GetStoreType(property)}";
+
+        internal static IEnumerable<string> BuildForeignKeySql(IReadOnlyEntityType entityType)
+        {
             foreach (var fk in entityType.GetForeignKeys())
             {
                 var constraintName = fk.GetConstraintName();
                 if (constraintName == null) continue;
 
-                var principalTable = fk.PrincipalEntityType.GetTableName()!;
-                var principalSchema = fk.PrincipalEntityType.GetSchema() ?? "public";
-
                 var columns = fk.Properties.Select(p => Q(p.GetColumnName()!));
                 var principalColumns = fk.PrincipalKey.Properties.Select(p => Q(p.GetColumnName()!));
-                var onDelete = MapDeleteBehavior(fk.DeleteBehavior);
 
-                var sql =
-                    $"ALTER TABLE {Q(schema)}.{Q(tableName)} " +
+                yield return
+                    $"ALTER TABLE {TableName(entityType)} " +
                     $"ADD CONSTRAINT {Q(constraintName)} " +
                     $"FOREIGN KEY ({string.Join(", ", columns)}) " +
-                    $"REFERENCES {Q(principalSchema)}.{Q(principalTable)} ({string.Join(", ", principalColumns)})" +
-                    onDelete;
-
-                await context.Database.ExecuteSqlRawAsync(sql);
+                    $"REFERENCES {TableName(fk.PrincipalEntityType)} ({string.Join(", ", principalColumns)})" +
+                    MapDeleteBehavior(fk.DeleteBehavior);
             }
+        }
+
+        private static async Task CreateTableFromEntityTypeAsync(DbContext context, IReadOnlyEntityType entityType)
+        {
+            await context.Database.ExecuteSqlRawAsync(BuildCreateTableSql(entityType));
+
+            foreach (var index in entityType.GetIndexes())
+                await context.Database.ExecuteSqlRawAsync(BuildCreateIndexSql(entityType, index));
+        }
+
+        private static async Task CreateForeignKeysForEntityTypeAsync(DbContext context, IReadOnlyEntityType entityType)
+        {
+            foreach (var sql in BuildForeignKeySql(entityType))
+                await context.Database.ExecuteSqlRawAsync(sql);
         }
 
         private static string MapDeleteBehavior(DeleteBehavior behavior) => behavior switch
